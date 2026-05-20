@@ -1,0 +1,3 @@
+waveAnimation.py
+blenderのadd-on Human Generator Ultimateを使ってひな壇のように整列した群衆を生成するもの
+一度に20体近く生成すると落ちてしまう
