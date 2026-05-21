@@ -1,3 +1,10 @@
 waveAnimation.py
 blenderのadd-on Human Generator Ultimateを使ってひな壇のように整列した群衆を生成するもの
 一度に20体近く生成すると落ちてしまう
+後でアニメーションを割り当てる機能を追加する
+
+waveAnimation_v02.py
+アニメーションのdelayの調節をできるようにした
+一度に生成する人をcollectionに入れるようにした
+キャラクターがハイポリすぎるから生成したときにモディファイアから
+subdivision surface,solidyfyを削除するのを追加したい
