@@ -8,3 +8,6 @@ waveAnimation_v02.py
 一度に生成する人をcollectionに入れるようにした
 キャラクターがハイポリすぎるから生成したときにモディファイアから
 subdivision surface,solidyfyを削除するのを追加したい
+服がかぶる
+髪の毛が非表示になってしまう
+顔がかぶる
