@@ -105,11 +105,15 @@ class CrowdAnimationProperties(bpy.types.PropertyGroup):
 class WaveAnimationProperties(bpy.types.PropertyGroup):
     wave_type: EnumProperty(
         name="Wave Type",
-        description="波の伝搬方向",
+        description="波の伝搬パターン",
         items=[
             ('LEFT', "From Left", "左端(col=0)から右へ波が伝搬する"),
             ('RIGHT', "From Right", "右端(col=cols-1)から左へ波が伝搬する"),
-            ('DIAGONAL', "Diagonal", "行番号+列番号が等しい反対角線ごとに波が伝搬する"),
+            ('TOP_LEFT', "From Top-Left", "左奥コーナー(row最大, col=0)から外側へ波が伝搬する"),
+            ('TOP_RIGHT', "From Top-Right", "右奥コーナー(row最大, col最大)から外側へ波が伝搬する"),
+            ('COL_PARITY', "Odd/Even Columns", "偶数列が同時、奇数列が同時(2フェーズで交互)"),
+            ('ROW_PARITY', "Odd/Even Rows", "偶数段が同時、奇数段が同時(2フェーズで交互)"),
+            ('DIAGONAL', "Diagonal Parity", "row+col が同じ反対角線が同時。さらに偶数/奇数の反対角線が同時(対角線ごとに交互)"),
         ],
         default='LEFT',
     )
@@ -268,9 +272,13 @@ class WaveAnimator:
     挙動:
       - 各リグの NLA に WAVE_TRACK_NAME という名前のトラックを用意
       - wave_type に応じた遅延フレームだけ後ろにずらして strip を貼る
-        - LEFT     : col*col_delay + row*row_delay
-        - RIGHT    : (cols-1-col)*col_delay + row*row_delay
-        - DIAGONAL : (row+col)*col_delay  (row+col が等しい反対角線が同時に動く)
+        - LEFT       : col*col_delay + row*row_delay
+        - RIGHT      : (cols-1-col)*col_delay + row*row_delay
+        - TOP_LEFT   : ((rows-1-row) + col)*col_delay        (左奥コーナーからの距離)
+        - TOP_RIGHT  : ((rows-1-row) + (cols-1-col))*col_delay (右奥コーナーからの距離)
+        - COL_PARITY : (col % 2)*col_delay                   (偶数列/奇数列の2フェーズ)
+        - ROW_PARITY : (row % 2)*col_delay                   (偶数段/奇数段の2フェーズ)
+        - DIAGONAL   : ((row+col) % 2)*col_delay             (反対角線が偶奇2フェーズで交互)
       - 同名 strip は一度消してから貼り直す(再適用しやすい)
     """
 
@@ -290,11 +298,19 @@ class WaveAnimator:
         self.row_delay = float(row_delay)
         self.track_name = track_name
 
-    def _delay_frames(self, row: int, col: int, cols: int) -> int:
+    def _delay_frames(self, row: int, col: int, rows: int, cols: int) -> int:
         if self.wave_type == 'RIGHT':
             offset = (cols - 1 - col) * self.col_delay + row * self.row_delay
+        elif self.wave_type == 'TOP_LEFT':
+            offset = ((rows - 1 - row) + col) * self.col_delay
+        elif self.wave_type == 'TOP_RIGHT':
+            offset = ((rows - 1 - row) + (cols - 1 - col)) * self.col_delay
+        elif self.wave_type == 'COL_PARITY':
+            offset = (col % 2) * self.col_delay
+        elif self.wave_type == 'ROW_PARITY':
+            offset = (row % 2) * self.col_delay
         elif self.wave_type == 'DIAGONAL':
-            offset = (row + col) * self.col_delay
+            offset = ((row + col) % 2) * self.col_delay
         else:  # 'LEFT'
             offset = col * self.col_delay + row * self.row_delay
         return int(round(offset))
@@ -309,8 +325,8 @@ class WaveAnimator:
             track.name = self.track_name
         return track
 
-    def _add_strip(self, rig: bpy.types.Object, row: int, col: int, cols: int):
-        start = self.start_frame + self._delay_frames(row, col, cols)
+    def _add_strip(self, rig: bpy.types.Object, row: int, col: int, rows: int, cols: int):
+        start = self.start_frame + self._delay_frames(row, col, rows, cols)
 
         track = self._ensure_track(rig)
         strip_name = f"wave_r{row}_c{col}"
@@ -322,13 +338,28 @@ class WaveAnimator:
 
     def apply(self) -> int:
         grid = build_grid(collect_crowd_rigs())
+        rows = len(grid)
         count = 0
         for row, row_rigs in enumerate(grid):
             cols = len(row_rigs)
             for col, rig in enumerate(row_rigs):
                 if rig is None:
                     continue
-                self._add_strip(rig, row, col, cols)
+                self._add_strip(rig, row, col, rows, cols)
+                count += 1
+        return count
+
+    @staticmethod
+    def remove(track_name: str = WAVE_TRACK_NAME) -> int:
+        """全リグから WAVE_TRACK_NAME トラック(と配下の strip)を削除する。削除した体数を返す。"""
+        count = 0
+        for rig in collect_crowd_rigs():
+            ad = rig.animation_data
+            if ad is None:
+                continue
+            track = ad.nla_tracks.get(track_name)
+            if track is not None:
+                ad.nla_tracks.remove(track)
                 count += 1
         return count
 
@@ -386,6 +417,21 @@ class CROWD_OT_APPLY_WAVE(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class CROWD_OT_REMOVE_WAVE(bpy.types.Operator):
+    bl_idname = "crowd.remove_wave"
+    bl_label = "Remove Wave Animation"
+    bl_description = "適用済みのウェーブ(NLA トラック)を全リグから取り除く"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        n = WaveAnimator.remove()
+        if n == 0:
+            self.report({'WARNING'}, "取り除くウェーブが見つかりません")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"{n} 体からウェーブを取り除きました")
+        return {'FINISHED'}
+
+
 # ============================================================
 # パネル UI
 # ============================================================
@@ -437,7 +483,9 @@ class WaveAnimationPanel(bpy.types.Panel):
         box.prop(wprops, "col_delay")
         box.prop(wprops, "row_delay")
 
-        layout.operator("crowd.apply_wave", icon='NLA')
+        row = layout.row(align=True)
+        row.operator("crowd.apply_wave", icon='NLA')
+        row.operator("crowd.remove_wave", icon='TRASH')
 
 
 class CrowdOffsetPanel(bpy.types.Panel):
@@ -466,6 +514,7 @@ classes = (
     CrowdOffsetProperties,
     CROWD_OT_ARRANGE,
     CROWD_OT_APPLY_WAVE,
+    CROWD_OT_REMOVE_WAVE,
     CrowdAnimationPanel,
     WaveAnimationPanel,
     CrowdOffsetPanel,
