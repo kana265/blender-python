@@ -15,10 +15,13 @@ bl_info = {
 # インポート
 # ============================================================
 import bpy
+import math
 import random
+from mathutils import Euler
 from bpy.props import (
     IntProperty,
     FloatProperty,
+    StringProperty,
     PointerProperty,
     FloatVectorProperty,
     EnumProperty,
@@ -35,6 +38,10 @@ MODEL_GROUPS = [("BOY", 10), ("GIRL", 10)]
 
 # NLA に積むトラック名(ウェーブ専用)
 WAVE_TRACK_NAME = "WaveAnimation"
+
+# 腕の傾きに個体差を出す加算レイヤー用のトラック名 / 生成アクションの接頭辞
+ARM_TRACK_NAME = "ArmVariation"
+ARM_ACTION_PREFIX = "armvar_"
 
 # 既定のウェーブアクション名(Action ピッカーが未設定のときの自動フォールバック)
 DEFAULT_WAVE_ACTION_NAME = "tutting"
@@ -136,6 +143,48 @@ class WaveAnimationProperties(bpy.types.PropertyGroup):
         name="Row Delay",
         description="1段(奥行き)ぶんずらすフレーム数。From Left/Right のときのみ加味",
         default=0.0,
+    )
+    timing_jitter: FloatProperty(
+        name="Timing Jitter",
+        description="各リグの開始フレームに加える ±ランダム量 [フレーム]。"
+                    "リズムが崩れない小さめの値(1拍未満)を推奨。波の機械的な均一さを崩す",
+        default=0.0, min=0.0, soft_max=5.0,
+    )
+    speed_jitter: FloatProperty(
+        name="Speed Jitter",
+        description="各リグの再生速度(NLA strip scale)に加える ±ランダム割合。"
+                    "動きの速さに個体差を出す(0.05 = ±5%)。大きいと拍からズレる",
+        default=0.0, min=0.0, max=0.5,
+    )
+    jitter_seed: IntProperty(
+        name="Jitter Seed",
+        description="ノイズ(timing / speed / phase / arm)の再現用シード。値を変えると揺らぎ方が変わる",
+        default=1, min=0,
+    )
+    # --- 位相ずらし(拍量子化): 各リグを拍単位でずらし、同じ瞬間に別のポーズにする ---
+    phase_jitter_beats: IntProperty(
+        name="Phase Jitter (beats)",
+        description="各リグの再生位相を 0〜N 拍ぶんランダムにずらす。拍単位なのでリズムは崩れない。"
+                    "ループするアクションだと『全員が踊りの別の箇所にいる』状態になり均一さが消える",
+        default=0, min=0, soft_max=8,
+    )
+    beat_frames: FloatProperty(
+        name="Frames / Beat",
+        description="1拍ぶんのフレーム数。Phase Jitter の量子化単位(例: 60fps・120BPM なら 30)",
+        default=8.0, min=1.0,
+    )
+    # --- 腕の傾きの個体差(加算 NLA レイヤー) ---
+    arm_tilt_deg: FloatProperty(
+        name="Arm Tilt Variation",
+        description="腕系ボーンに加える ±ランダム回転の最大角度 [度]。0 で無効。"
+                    "踊りを保ったまま各リグの腕の傾きだけ変える(加算レイヤー)",
+        default=0.0, min=0.0, soft_max=20.0,
+    )
+    arm_bones: StringProperty(
+        name="Arm Bone Filter",
+        description="対象ボーン名のフィルタ(カンマ区切り・部分一致・大小無視)。"
+                    "リグの命名に合わせて調整する",
+        default="arm,shoulder,forearm,hand",
     )
 
 
@@ -289,6 +338,11 @@ class WaveAnimator:
         start_frame: int = 1,
         col_delay: float = 3.0,
         row_delay: float = 0.0,
+        timing_jitter: float = 0.0,
+        speed_jitter: float = 0.0,
+        phase_jitter_beats: int = 0,
+        beat_frames: float = 8.0,
+        jitter_seed: int = 1,
         track_name: str = WAVE_TRACK_NAME,
     ):
         self.action = action
@@ -296,7 +350,16 @@ class WaveAnimator:
         self.start_frame = int(start_frame)
         self.col_delay = float(col_delay)
         self.row_delay = float(row_delay)
+        self.timing_jitter = float(timing_jitter)
+        self.speed_jitter = float(speed_jitter)
+        self.phase_jitter_beats = int(phase_jitter_beats)
+        self.beat_frames = float(beat_frames)
+        self.jitter_seed = int(jitter_seed)
         self.track_name = track_name
+
+    def _rig_rng(self, row: int, col: int) -> random.Random:
+        """(row, col) ごとに決定的な乱数発生器。再適用しても同じ揺らぎを再現する。"""
+        return random.Random(self.jitter_seed * 1000003 + row * 1009 + col)
 
     def _delay_frames(self, row: int, col: int, rows: int, cols: int) -> int:
         if self.wave_type == 'RIGHT':
@@ -326,7 +389,17 @@ class WaveAnimator:
         return track
 
     def _add_strip(self, rig: bpy.types.Object, row: int, col: int, rows: int, cols: int):
+        rng = self._rig_rng(row, col)
+
         start = self.start_frame + self._delay_frames(row, col, rows, cols)
+        # 位相ずらし: 0〜N 拍ぶんを拍単位でずらす(リズムを保ったまま位相を散らす)
+        if self.phase_jitter_beats > 0 and self.beat_frames > 0.0:
+            beats = rng.randint(0, self.phase_jitter_beats)
+            start += int(round(beats * self.beat_frames))
+        # タイミングノイズ: ±timing_jitter フレームの揺らぎ(機械的な均一さを崩す)
+        if self.timing_jitter > 0.0:
+            start += int(round(rng.uniform(-self.timing_jitter, self.timing_jitter)))
+        start = max(start, 0)
 
         track = self._ensure_track(rig)
         strip_name = f"wave_r{row}_c{col}"
@@ -334,7 +407,13 @@ class WaveAnimator:
         for s in list(track.strips):
             if s.name == strip_name:
                 track.strips.remove(s)
-        return track.strips.new(strip_name, start, self.action)
+        strip = track.strips.new(strip_name, start, self.action)
+
+        # 速度ノイズ: 再生スピードに個体差をつける(動きの速さを揃えすぎない)
+        if self.speed_jitter > 0.0:
+            strip.scale = 1.0 + rng.uniform(-self.speed_jitter, self.speed_jitter)
+
+        return strip
 
     def apply(self) -> int:
         grid = build_grid(collect_crowd_rigs())
@@ -362,6 +441,91 @@ class WaveAnimator:
                 ad.nla_tracks.remove(track)
                 count += 1
         return count
+
+
+# ============================================================
+# 腕の傾きの個体差(加算 NLA レイヤー)
+# ============================================================
+def _arm_target_bones(rig: bpy.types.Object, tokens: list[str]) -> list:
+    """名前に tokens のいずれかを含むポーズボーンを返す(大小無視・部分一致)。"""
+    if not tokens:
+        return []
+    return [pb for pb in rig.pose.bones
+            if any(t in pb.name.lower() for t in tokens)]
+
+
+def clear_arm_variation(rig: bpy.types.Object):
+    """リグから ArmVariation トラックを外し、専用に生成したアクションを掃除する。"""
+    ad = rig.animation_data
+    if ad is None:
+        return
+    track = ad.nla_tracks.get(ARM_TRACK_NAME)
+    if track is None:
+        return
+    acts = [s.action for s in track.strips if s.action is not None]
+    ad.nla_tracks.remove(track)
+    for a in acts:
+        if a.users == 0 and a.name.startswith(ARM_ACTION_PREFIX):
+            try:
+                bpy.data.actions.remove(a)
+            except Exception:
+                pass
+
+
+def apply_arm_variation(tilt_deg: float, bone_filter: str, seed: int) -> int:
+    """各リグに、腕系ボーンを微小回転させる加算レイヤーを重ねる。適用した体数を返す。
+
+    - 踊り本体(WaveAnimation)はそのまま、上に blend_type='ADD' の1キーアクションを重ねる。
+    - ボーンの rotation_mode に合わせて euler / quaternion で値を入れる。
+    - (row, col) ごとに決定的な乱数を使い、再適用で同じ傾きを再現する。
+    """
+    tokens = [t.strip().lower() for t in bone_filter.split(",") if t.strip()]
+    amp = math.radians(tilt_deg)
+    count = 0
+
+    for rig in collect_crowd_rigs():
+        # 既存の腕レイヤーを作り直す(再適用しやすいように)
+        clear_arm_variation(rig)
+        if amp <= 0.0:
+            continue
+
+        bones = _arm_target_bones(rig, tokens)
+        if not bones:
+            continue
+
+        row = int(rig[PROP_ROW])
+        col = int(rig[PROP_COL])
+        rng = random.Random(seed * 7919 + row * 131 + col + 17)
+
+        act = bpy.data.actions.new(f"{ARM_ACTION_PREFIX}{rig.name}")
+        for pb in bones:
+            rx = rng.uniform(-amp, amp)
+            ry = rng.uniform(-amp, amp)
+            rz = rng.uniform(-amp, amp)
+            if pb.rotation_mode == 'QUATERNION':
+                q = Euler((rx, ry, rz), 'XYZ').to_quaternion()
+                path = f'pose.bones["{pb.name}"].rotation_quaternion'
+                for i, v in enumerate((q.w, q.x, q.y, q.z)):
+                    fc = act.fcurves.new(path, index=i)
+                    fc.keyframe_points.insert(1.0, v)
+            else:
+                path = f'pose.bones["{pb.name}"].rotation_euler'
+                for i, v in enumerate((rx, ry, rz)):
+                    fc = act.fcurves.new(path, index=i)
+                    fc.keyframe_points.insert(1.0, v)
+
+        if rig.animation_data is None:
+            rig.animation_data_create()
+        ad = rig.animation_data
+        # ADD トラックは後から追加するとスタック最上段=波の上に乗る
+        track = ad.nla_tracks.new()
+        track.name = ARM_TRACK_NAME
+        strip = track.strips.new("armvar", 1, act)
+        strip.blend_type = 'ADD'
+        strip.extrapolation = 'HOLD'  # 1キーを全フレームに適用
+        count += 1
+
+    return count
 
 
 # ============================================================
@@ -407,6 +571,11 @@ class CROWD_OT_APPLY_WAVE(bpy.types.Operator):
             start_frame=wprops.start_frame,
             col_delay=wprops.col_delay,
             row_delay=wprops.row_delay,
+            timing_jitter=wprops.timing_jitter,
+            speed_jitter=wprops.speed_jitter,
+            phase_jitter_beats=wprops.phase_jitter_beats,
+            beat_frames=wprops.beat_frames,
+            jitter_seed=wprops.jitter_seed,
         )
         n = animator.apply()
         if n == 0:
@@ -420,15 +589,42 @@ class CROWD_OT_APPLY_WAVE(bpy.types.Operator):
 class CROWD_OT_REMOVE_WAVE(bpy.types.Operator):
     bl_idname = "crowd.remove_wave"
     bl_label = "Remove Wave Animation"
-    bl_description = "適用済みのウェーブ(NLA トラック)を全リグから取り除く"
+    bl_description = "適用済みのウェーブと腕バリエーション(NLA トラック)を全リグから取り除く"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         n = WaveAnimator.remove()
+        for rig in collect_crowd_rigs():
+            clear_arm_variation(rig)
         if n == 0:
             self.report({'WARNING'}, "取り除くウェーブが見つかりません")
             return {'CANCELLED'}
         self.report({'INFO'}, f"{n} 体からウェーブを取り除きました")
+        return {'FINISHED'}
+
+
+class CROWD_OT_APPLY_ARM_VARIATION(bpy.types.Operator):
+    bl_idname = "crowd.apply_arm_variation"
+    bl_label = "Apply Arm Variation"
+    bl_description = "腕系ボーンに個体差(微小回転)を加える加算レイヤーを全リグに重ねる"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        wprops = context.scene.wave_animation_props
+        if wprops.arm_tilt_deg <= 0.0:
+            self.report({'ERROR'}, "Arm Tilt Variation を 0 より大きくしてください")
+            return {'CANCELLED'}
+
+        n = apply_arm_variation(
+            wprops.arm_tilt_deg,
+            wprops.arm_bones,
+            wprops.jitter_seed,
+        )
+        if n == 0:
+            self.report({'WARNING'},
+                        "対象リグ/ボーンが見つかりません(Arrange 済みか、Bone Filter を確認)")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"{n} 体に腕バリエーションを適用しました")
         return {'FINISHED'}
 
 
@@ -483,9 +679,25 @@ class WaveAnimationPanel(bpy.types.Panel):
         box.prop(wprops, "col_delay")
         box.prop(wprops, "row_delay")
 
+        jbox = layout.box()
+        jbox.label(text="Noise / Variation", icon='MOD_NOISE')
+        jbox.prop(wprops, "timing_jitter")
+        jbox.prop(wprops, "speed_jitter")
+        jbox.separator()
+        jbox.prop(wprops, "phase_jitter_beats")
+        jbox.prop(wprops, "beat_frames")
+        jbox.separator()
+        jbox.prop(wprops, "jitter_seed")
+
         row = layout.row(align=True)
         row.operator("crowd.apply_wave", icon='NLA')
         row.operator("crowd.remove_wave", icon='TRASH')
+
+        abox = layout.box()
+        abox.label(text="Arm Variation (additive)", icon='BONE_DATA')
+        abox.prop(wprops, "arm_tilt_deg")
+        abox.prop(wprops, "arm_bones")
+        abox.operator("crowd.apply_arm_variation", icon='CONSTRAINT_BONE')
 
 
 class CrowdOffsetPanel(bpy.types.Panel):
@@ -515,6 +727,7 @@ classes = (
     CROWD_OT_ARRANGE,
     CROWD_OT_APPLY_WAVE,
     CROWD_OT_REMOVE_WAVE,
+    CROWD_OT_APPLY_ARM_VARIATION,
     CrowdAnimationPanel,
     WaveAnimationPanel,
     CrowdOffsetPanel,
